@@ -1,0 +1,1444 @@
+<?php
+// 聊天记录API接口
+header('Content-Type: application/json');
+
+require_once __DIR__ . '/../inc/db.php';
+require_once __DIR__ . '/../inc/users.php';
+
+$type = $_REQUEST["type"] ?? "";
+$appid = $_REQUEST["appid"] ?? "";
+$name = $_REQUEST["name"] ?? date("Y-m-d").".log";
+$path = dirname(__DIR__, 2)."/Log/{$appid}/".$name;
+
+/*
+①获取聊天记录列表（按群聊/私聊分组）
+type = list
+appid
+name = 日志文件名
+
+②获取指定群聊/私聊的聊天记录
+type = messages
+appid
+name = 日志文件名
+chat_type = group/private
+chat_id = 群聊ID或用户ID
+*/
+
+switch ($type) {
+    case "list":
+        // 获取所有聊天会话列表（群聊和私聊）
+        if (!is_file($path)) {
+            echo json_encode([
+                "code" => 404,
+                "msg" => "日志文件不存在"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $content = file_get_contents($path);
+        if (empty($content)) {
+            echo json_encode([
+                "code" => 200,
+                "groups" => [],
+                "privates" => []
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $content = explode("\n", $content);
+        $groups = []; // 群聊列表
+        $privates = []; // 私聊列表
+        
+        foreach ($content as $value) {
+            if (preg_match('/^\[([^\]]+)\]\s*(.*)$/', $value, $matches)) {
+                $time = $matches[1];
+                $json = $matches[2];
+                
+                if ($json == "重复数据") {
+                    continue;
+                }
+                
+                try {
+                    $data = json_decode($json, true);
+                    if (!is_array($data)) continue;
+                    
+                    $eventType = $data["t"] ?? "";
+                    
+                    // 处理用户消息
+                    if ($eventType == "GROUP_AT_MESSAGE_CREATE") {
+                        // 群聊ID可能在group_id或group_openid字段
+                        $groupId = $data["d"]["group_id"] ?? $data["d"]["group_openid"] ?? "";
+                        if ($groupId && !isset($groups[$groupId])) {
+                            $groups[$groupId] = [
+                                "id" => $groupId,
+                                "type" => "group",
+                                "last_message_time" => $time,
+                                "last_message" => trim($data["d"]["content"] ?? "", "/ "),
+                                "message_count" => 0
+                            ];
+                        }
+                        if ($groupId) {
+                            $groups[$groupId]["message_count"]++;
+                            if (strtotime($time) > strtotime($groups[$groupId]["last_message_time"])) {
+                                $groups[$groupId]["last_message_time"] = $time;
+                                $groups[$groupId]["last_message"] = trim($data["d"]["content"] ?? "", "/ ");
+                            }
+                        }
+                    } elseif ($eventType == "C2C_MESSAGE_CREATE") {
+                        $userId = $data["d"]["author"]["id"] ?? "";
+                        if ($userId && !isset($privates[$userId])) {
+                            $privates[$userId] = [
+                                "id" => $userId,
+                                "type" => "private",
+                                "last_message_time" => $time,
+                                "last_message" => trim($data["d"]["content"] ?? "", "/ "),
+                                "message_count" => 0
+                            ];
+                        }
+                        if ($userId) {
+                            $privates[$userId]["message_count"]++;
+                            if (strtotime($time) > strtotime($privates[$userId]["last_message_time"])) {
+                                $privates[$userId]["last_message_time"] = $time;
+                                $privates[$userId]["last_message"] = trim($data["d"]["content"] ?? "", "/ ");
+                            }
+                        }
+                    } elseif ($eventType == "GROUP_ADD_ROBOT" || $eventType == "GROUP_DEL_ROBOT") {
+                        $groupId = $data["d"]["group_openid"] ?? "";
+                        if ($groupId && !isset($groups[$groupId])) {
+                            $groups[$groupId] = [
+                                "id" => $groupId,
+                                "type" => "group",
+                                "last_message_time" => $time,
+                                "last_message" => $eventType == "GROUP_ADD_ROBOT" ? "[加群事件]" : "[退群事件]",
+                                "message_count" => 0
+                            ];
+                        }
+                    } elseif ($eventType == "FRIEND_ADD") {
+                        // 好友添加事件
+                        $userId = $data["d"]["openid"] ?? $data["d"]["author"]["id"] ?? "";
+                        if ($userId && !isset($privates[$userId])) {
+                            $privates[$userId] = [
+                                "id" => $userId,
+                                "type" => "private",
+                                "last_message_time" => $time,
+                                "last_message" => "[加好友事件]",
+                                "message_count" => 0
+                            ];
+                        }
+                    } elseif ($eventType == "FRIEND_DEL") {
+                        // 好友删除事件
+                        $userId = $data["d"]["openid"] ?? $data["d"]["author"]["id"] ?? "";
+                        if ($userId && !isset($privates[$userId])) {
+                            $privates[$userId] = [
+                                "id" => $userId,
+                                "type" => "private",
+                                "last_message_time" => $time,
+                                "last_message" => "[被删除好友]",
+                                "message_count" => 0
+                            ];
+                        }
+                    } elseif ($eventType == "BOT_MESSAGE") {
+                        // 机器人发送的消息
+                        $botData = $data["d"] ?? [];
+                        $source = $botData["source"] ?? "";
+                        $target = $botData["target"] ?? "";
+                        
+                        if ($source == "群聊" && $target) {
+                            if (!isset($groups[$target])) {
+                                $groups[$target] = [
+                                    "id" => $target,
+                                    "type" => "group",
+                                    "last_message_time" => $time,
+                                    "last_message" => $botData["content"] ?? "",
+                                    "message_count" => 0
+                                ];
+                            }
+                            $groups[$target]["message_count"]++;
+                            if (strtotime($time) > strtotime($groups[$target]["last_message_time"])) {
+                                $groups[$target]["last_message_time"] = $time;
+                                $groups[$target]["last_message"] = $botData["content"] ?? "";
+                            }
+                        } elseif ($source == "私聊" && $target) {
+                            if (!isset($privates[$target])) {
+                                $privates[$target] = [
+                                    "id" => $target,
+                                    "type" => "private",
+                                    "last_message_time" => $time,
+                                    "last_message" => $botData["content"] ?? "",
+                                    "message_count" => 0
+                                ];
+                            }
+                            $privates[$target]["message_count"]++;
+                            if (strtotime($time) > strtotime($privates[$target]["last_message_time"])) {
+                                $privates[$target]["last_message_time"] = $time;
+                                $privates[$target]["last_message"] = $botData["content"] ?? "";
+                            }
+                        }
+                    }
+                } catch (Exception $e) {
+                    continue;
+                }
+            }
+        }
+        
+        // 转换为数组并按时间排序
+        $groupsList = array_values($groups);
+        $privatesList = array_values($privates);
+        
+        // 按最后消息时间倒序排序
+        usort($groupsList, function($a, $b) {
+            return strtotime($b["last_message_time"]) - strtotime($a["last_message_time"]);
+        });
+        
+        usort($privatesList, function($a, $b) {
+            return strtotime($b["last_message_time"]) - strtotime($a["last_message_time"]);
+        });
+        
+        echo json_encode([
+            "code" => 200,
+            "groups" => $groupsList,
+            "privates" => $privatesList
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+        
+    case "messages":
+        // 获取指定聊天会话的消息记录
+        $chatType = $_REQUEST["chat_type"] ?? "";
+        $chatId = $_REQUEST["chat_id"] ?? "";
+        
+        if (empty($chatType) || empty($chatId)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "缺少必要参数"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        if (!is_file($path)) {
+            echo json_encode([
+                "code" => 404,
+                "msg" => "日志文件不存在"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $content = file_get_contents($path);
+        if (empty($content)) {
+            echo json_encode([
+                "code" => 200,
+                "messages" => []
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $content = explode("\n", $content);
+        $messages = [];
+        $previousCardMessages = []; // 存储之前的卡片消息，用于查找视频/语音链接
+        
+        // 先遍历一遍，收集所有卡片消息的链接
+        foreach ($content as $value) {
+            if (preg_match('/^\[([^\]]+)\]\s*(.*)$/', $value, $matches)) {
+                $time = $matches[1];
+                $json = $matches[2];
+                
+                if ($json == "重复数据") {
+                    continue;
+                }
+                
+                try {
+                    $data = json_decode($json, true);
+                    if (!is_array($data)) continue;
+                    
+                    $eventType = $data["t"] ?? "";
+                    
+                    // 收集卡片消息的链接
+                    if ($eventType == "BOT_MESSAGE") {
+                        $botData = $data["d"] ?? [];
+                        $source = $botData["source"] ?? "";
+                        $target = $botData["target"] ?? "";
+                        
+                        if (($source == "群聊" && $chatType == "group" && $target == $chatId) ||
+                            ($source == "私聊" && $chatType == "private" && $target == $chatId)) {
+                            if (($botData["type"] == "card" || $botData["type"] == "ark") && 
+                                isset($botData["card_data"]) && is_array($botData["card_data"])) {
+                                foreach ($botData["card_data"] as $cardItem) {
+                                    if (isset($cardItem["url"])) {
+                                        $previousCardMessages[] = [
+                                            "time" => $time,
+                                            "url" => $cardItem["url"],
+                                            "text" => $cardItem["text"] ?? ""
+                                        ];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception $e) {
+                    continue;
+                }
+            }
+        }
+        
+        // 重新遍历，处理所有消息
+        foreach ($content as $value) {
+            if (preg_match('/^\[([^\]]+)\]\s*(.*)$/', $value, $matches)) {
+                $time = $matches[1];
+                $json = $matches[2];
+                
+                if ($json == "重复数据") {
+                    continue;
+                }
+                
+                try {
+                    $data = json_decode($json, true);
+                    if (!is_array($data)) continue;
+                    
+                    $eventType = $data["t"] ?? "";
+                    $message = null;
+                    
+                    if ($chatType == "group") {
+                        // 群聊消息
+                        if ($eventType == "GROUP_AT_MESSAGE_CREATE") {
+                            // 群聊ID可能在group_id或group_openid字段
+                            $groupId = $data["d"]["group_id"] ?? $data["d"]["group_openid"] ?? "";
+                            if ($groupId == $chatId) {
+                                $userId = $data["d"]["author"]["id"] ?? "";
+                                $content = trim($data["d"]["content"] ?? "", "/ ");
+                                $messageId = $data["d"]["id"] ?? "";
+                                $rawUsername = $data["d"]["author"]["username"] ?? "";
+                                $memberNick = $data["d"]["member"]["nick"] ?? "";
+                                $username = $rawUsername ?: ($memberNick ?: ("用户" . substr($userId, -6)));
+                                
+                                // 提取图片
+                                $imageUrls = [];
+                                if (isset($data["d"]["attachments"]) && is_array($data["d"]["attachments"])) {
+                                    foreach ($data["d"]["attachments"] as $attachment) {
+                                        if (isset($attachment["url"]) && isset($attachment["content_type"]) && 
+                                            strpos($attachment["content_type"], "image/") === 0) {
+                                            $imageUrls[] = $attachment["url"];
+                                        }
+                                    }
+                                }
+                                
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "user",
+                                    "user_id" => $userId,
+                                    "username" => $username,
+                                    "raw_username" => $rawUsername,
+                                    "content" => $content,
+                                    "message_id" => $messageId,
+                                    "image_urls" => $imageUrls
+                                ];
+                            }
+                        } elseif ($eventType == "GROUP_ADD_ROBOT") {
+                            $groupId = $data["d"]["group_openid"] ?? "";
+                            if ($groupId == $chatId) {
+                                $operatorId = $data["d"]["op_member_openid"] ?? "";
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "event",
+                                    "event_type" => "group_join",
+                                    "operator_id" => $operatorId,
+                                    "content" => "加入群聊"
+                                ];
+                            }
+                        } elseif ($eventType == "GROUP_DEL_ROBOT") {
+                            $groupId = $data["d"]["group_openid"] ?? "";
+                            if ($groupId == $chatId) {
+                                $operatorId = $data["d"]["op_member_openid"] ?? "";
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "event",
+                                    "event_type" => "group_leave",
+                                    "operator_id" => $operatorId,
+                                    "content" => "退出群聊"
+                                ];
+                            }
+                        } elseif (isset($data["direction"]) && $data["direction"] === "发送") {
+                            // 兼容新日志结构：发送记录（无 BOT_MESSAGE 事件）
+                            $sourceType = $data["source_type"] ?? "";
+                            $targetId = $data["target_id"] ?? "";
+                            if (($sourceType === "群聊" || $sourceType === "互动") && $targetId == $chatId) {
+                                $rawType = $data["content_type"] ?? "text";
+                                $rawTypeNorm = strtolower(trim((string)$rawType));
+                                $mappedType = (strpos($rawTypeNorm, 'md') !== false || strpos((string)($data['action'] ?? ''), '原生MD') !== false) ? 'native_md' : ((strpos($rawTypeNorm, '卡') !== false) ? 'card' : 'text');
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "bot",
+                                    "content" => $data["content"] ?? "",
+                                    "message_type" => $mappedType,
+                                    "image_url" => null,
+                                    "voice_url" => null,
+                                    "voice_url_silk" => null,
+                                    "video_url" => null,
+                                    "card_data" => null
+                                ];
+                            }
+                        } elseif ($eventType == "BOT_MESSAGE") {
+                            $botData = $data["d"] ?? [];
+                            $source = $botData["source"] ?? "";
+                            $target = $botData["target"] ?? "";
+                            
+                            if ($source == "群聊" && $target == $chatId) {
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "bot",
+                                    "content" => $botData["content"] ?? "",
+                                    "message_type" => $botData["type"] ?? "text",
+                                    "image_url" => $botData["image_url"] ?? null,
+                                    "voice_url" => $botData["voice_url"] ?? null,
+                                    "voice_url_silk" => $botData["voice_url_silk"] ?? null,
+                                    "video_url" => $botData["video_url"] ?? null,
+                                    "card_data" => $botData["card_data"] ?? null
+                                ];
+                                
+                                // 如果是卡片消息，保存起来供后续视频/语音消息使用
+                                if (($botData["type"] == "card" || $botData["type"] == "ark") && 
+                                    isset($botData["card_data"]) && is_array($botData["card_data"])) {
+                                    foreach ($botData["card_data"] as $cardItem) {
+                                        if (isset($cardItem["url"])) {
+                                            $previousCardMessages[] = [
+                                                "time" => $time,
+                                                "url" => $cardItem["url"],
+                                                "text" => $cardItem["text"] ?? ""
+                                            ];
+                                        }
+                                    }
+                                }
+                                
+                                // 如果视频/语音没有URL，尝试从content中提取链接
+                                if (($botData["type"] == "video" || $botData["type"] == "voice") && 
+                                    !$message["video_url"] && !$message["voice_url"]) {
+                                    // 首先从content中提取链接
+                                    if (!empty($botData["content"]) && 
+                                        preg_match('/\(?(https?:\/\/[^\s\)]+)\)?/', $botData["content"], $matches)) {
+                                        if ($botData["type"] == "video") {
+                                            $message["video_url"] = $matches[1];
+                                        } elseif ($botData["type"] == "voice") {
+                                            $message["voice_url"] = $matches[1];
+                                        }
+                                    } else {
+                                        // 如果content中没有，尝试从最近的卡片消息中获取链接
+                                        // 查找时间相近（5秒内）的卡片消息
+                                        foreach ($previousCardMessages as $cardMsg) {
+                                            $timeDiff = abs(strtotime($time) - strtotime($cardMsg["time"]));
+                                            if ($timeDiff <= 5) {
+                                                // 检查卡片文本是否包含"视频"或"语音"关键词
+                                                $cardText = strtolower($cardMsg["text"]);
+                                                if (($botData["type"] == "video" && (strpos($cardText, "视频") !== false || strpos($cardText, "shipin") !== false)) ||
+                                                    ($botData["type"] == "voice" && (strpos($cardText, "语音") !== false || strpos($cardText, "音乐") !== false))) {
+                                                    if ($botData["type"] == "video") {
+                                                        $message["video_url"] = $cardMsg["url"];
+                                                    } elseif ($botData["type"] == "voice") {
+                                                        $message["voice_url"] = $cardMsg["url"];
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } elseif ($chatType == "private") {
+                        // 私聊消息
+                        if ($eventType == "C2C_MESSAGE_CREATE") {
+                            $userId = $data["d"]["author"]["id"] ?? "";
+                            if ($userId == $chatId) {
+                                $content = trim($data["d"]["content"] ?? "", "/ ");
+                                $messageId = $data["d"]["id"] ?? "";
+                                $rawUsername = $data["d"]["author"]["username"] ?? "";
+                                $memberNick = $data["d"]["member"]["nick"] ?? "";
+                                $username = $rawUsername ?: ($memberNick ?: ("用户" . substr($userId, -6)));
+                                
+                                // 提取图片
+                                $imageUrls = [];
+                                if (isset($data["d"]["attachments"]) && is_array($data["d"]["attachments"])) {
+                                    foreach ($data["d"]["attachments"] as $attachment) {
+                                        if (isset($attachment["url"]) && isset($attachment["content_type"]) && 
+                                            strpos($attachment["content_type"], "image/") === 0) {
+                                            $imageUrls[] = $attachment["url"];
+                                        }
+                                    }
+                                }
+                                
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "user",
+                                    "user_id" => $userId,
+                                    "username" => $username,
+                                    "raw_username" => $rawUsername,
+                                    "content" => $content,
+                                    "message_id" => $messageId,
+                                    "image_urls" => $imageUrls
+                                ];
+                            }
+                        } elseif ($eventType == "FRIEND_ADD") {
+                            // 好友添加事件
+                            $userId = $data["d"]["openid"] ?? $data["d"]["author"]["id"] ?? "";
+                            if ($userId == $chatId) {
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "event",
+                                    "event_type" => "friend_add",
+                                    "user_id" => $userId,
+                                    "content" => "添加了好友"
+                                ];
+                            }
+                        } elseif ($eventType == "FRIEND_DEL") {
+                            // 好友删除事件
+                            $userId = $data["d"]["openid"] ?? $data["d"]["author"]["id"] ?? "";
+                            if ($userId == $chatId) {
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "event",
+                                    "event_type" => "friend_delete",
+                                    "user_id" => $userId,
+                                    "content" => "被删除好友"
+                                ];
+                            }
+                        } elseif (isset($data["direction"]) && $data["direction"] === "发送") {
+                            // 兼容新日志结构：发送记录（无 BOT_MESSAGE 事件）
+                            $sourceType = $data["source_type"] ?? "";
+                            $targetId = $data["target_id"] ?? "";
+                            if ($sourceType === "私聊" && $targetId == $chatId) {
+                                $rawType = $data["content_type"] ?? "text";
+                                $rawTypeNorm = strtolower(trim((string)$rawType));
+                                $mappedType = (strpos($rawTypeNorm, 'md') !== false || strpos((string)($data['action'] ?? ''), '原生MD') !== false) ? 'native_md' : ((strpos($rawTypeNorm, '卡') !== false) ? 'card' : 'text');
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "bot",
+                                    "content" => $data["content"] ?? "",
+                                    "message_type" => $mappedType,
+                                    "image_url" => null,
+                                    "voice_url" => null,
+                                    "voice_url_silk" => null,
+                                    "video_url" => null,
+                                    "card_data" => null
+                                ];
+                            }
+                        } elseif ($eventType == "BOT_MESSAGE") {
+                            $botData = $data["d"] ?? [];
+                            $source = $botData["source"] ?? "";
+                            $target = $botData["target"] ?? "";
+                            
+                            if ($source == "私聊" && $target == $chatId) {
+                                $message = [
+                                    "time" => $time,
+                                    "type" => "bot",
+                                    "content" => $botData["content"] ?? "",
+                                    "message_type" => $botData["type"] ?? "text",
+                                    "image_url" => $botData["image_url"] ?? null,
+                                    "voice_url" => $botData["voice_url"] ?? null,
+                                    "voice_url_silk" => $botData["voice_url_silk"] ?? null,
+                                    "video_url" => $botData["video_url"] ?? null,
+                                    "card_data" => $botData["card_data"] ?? null
+                                ];
+                                
+                                // 如果是卡片消息，保存起来供后续视频/语音消息使用
+                                if (($botData["type"] == "card" || $botData["type"] == "ark") && 
+                                    isset($botData["card_data"]) && is_array($botData["card_data"])) {
+                                    foreach ($botData["card_data"] as $cardItem) {
+                                        if (isset($cardItem["url"])) {
+                                            $previousCardMessages[] = [
+                                                "time" => $time,
+                                                "url" => $cardItem["url"],
+                                                "text" => $cardItem["text"] ?? ""
+                                            ];
+                                        }
+                                    }
+                                }
+                                
+                                // 如果视频/语音没有URL，尝试从content中提取链接
+                                if (($botData["type"] == "video" || $botData["type"] == "voice") && 
+                                    !$message["video_url"] && !$message["voice_url"]) {
+                                    // 首先从content中提取链接
+                                    if (!empty($botData["content"]) && 
+                                        preg_match('/\(?(https?:\/\/[^\s\)]+)\)?/', $botData["content"], $matches)) {
+                                        if ($botData["type"] == "video") {
+                                            $message["video_url"] = $matches[1];
+                                        } elseif ($botData["type"] == "voice") {
+                                            $message["voice_url"] = $matches[1];
+                                        }
+                                    } else {
+                                        // 如果content中没有，尝试从最近的卡片消息中获取链接
+                                        // 查找时间相近（5秒内）的卡片消息
+                                        foreach ($previousCardMessages as $cardMsg) {
+                                            $timeDiff = abs(strtotime($time) - strtotime($cardMsg["time"]));
+                                            if ($timeDiff <= 5) {
+                                                // 检查卡片文本是否包含"视频"或"语音"关键词
+                                                $cardText = strtolower($cardMsg["text"]);
+                                                if (($botData["type"] == "video" && (strpos($cardText, "视频") !== false || strpos($cardText, "shipin") !== false)) ||
+                                                    ($botData["type"] == "voice" && (strpos($cardText, "语音") !== false || strpos($cardText, "音乐") !== false))) {
+                                                    if ($botData["type"] == "video") {
+                                                        $message["video_url"] = $cardMsg["url"];
+                                                    } elseif ($botData["type"] == "voice") {
+                                                        $message["voice_url"] = $cardMsg["url"];
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if ($message) {
+                        $messages[] = $message;
+                    }
+                } catch (Exception $e) {
+                    continue;
+                }
+            }
+        }
+        
+        // 按时间正序排序（最早的在前面）
+        usort($messages, function($a, $b) {
+            return strtotime($a["time"]) - strtotime($b["time"]);
+        });
+        
+        echo json_encode([
+            "code" => 200,
+            "messages" => $messages
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+        
+    case "search":
+        // 搜索消息
+        $keyword = $_REQUEST["keyword"] ?? "";
+        $chatType = $_REQUEST["chat_type"] ?? ""; // 可选：group/private，为空则搜索所有
+        
+        if (empty($keyword)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "搜索关键词不能为空"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        if (!is_file($path)) {
+            echo json_encode([
+                "code" => 404,
+                "msg" => "日志文件不存在"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $content = file_get_contents($path);
+        if (empty($content)) {
+            echo json_encode([
+                "code" => 200,
+                "results" => []
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $content = explode("\n", $content);
+        $results = [];
+        $keywordLower = mb_strtolower($keyword, 'UTF-8');
+        
+        foreach ($content as $value) {
+            if (preg_match('/^\[([^\]]+)\]\s*(.*)$/', $value, $matches)) {
+                $time = $matches[1];
+                $json = $matches[2];
+                
+                if ($json == "重复数据") {
+                    continue;
+                }
+                
+                try {
+                    $data = json_decode($json, true);
+                    if (!is_array($data)) continue;
+                    
+                    $eventType = $data["t"] ?? "";
+                    $matched = false;
+                    $chatId = "";
+                    $chatTypeFound = "";
+                    $contentText = "";
+                    $userId = "";
+                    
+                    // 检查用户消息
+                    if ($eventType == "GROUP_AT_MESSAGE_CREATE") {
+                        $chatId = $data["d"]["group_id"] ?? $data["d"]["group_openid"] ?? "";
+                        $chatTypeFound = "group";
+                        $userId = $data["d"]["author"]["id"] ?? "";
+                        $contentText = trim($data["d"]["content"] ?? "", "/ ");
+                        
+                        // 匹配ID或内容
+                        if (stripos($chatId, $keyword) !== false || 
+                            stripos($userId, $keyword) !== false ||
+                            stripos($contentText, $keyword) !== false) {
+                            $matched = true;
+                        }
+                    } elseif ($eventType == "C2C_MESSAGE_CREATE") {
+                        $chatId = $data["d"]["author"]["id"] ?? "";
+                        $chatTypeFound = "private";
+                        $userId = $chatId;
+                        $contentText = trim($data["d"]["content"] ?? "", "/ ");
+                        
+                        // 匹配ID或内容
+                        if (stripos($chatId, $keyword) !== false ||
+                            stripos($contentText, $keyword) !== false) {
+                            $matched = true;
+                        }
+                    } elseif ($eventType == "BOT_MESSAGE") {
+                        $botData = $data["d"] ?? [];
+                        $source = $botData["source"] ?? "";
+                        $target = $botData["target"] ?? "";
+                        $contentText = $botData["content"] ?? "";
+                        
+                        if ($source == "群聊") {
+                            $chatId = $target;
+                            $chatTypeFound = "group";
+                        } elseif ($source == "私聊") {
+                            $chatId = $target;
+                            $chatTypeFound = "private";
+                        }
+                        
+                        // 匹配ID或内容
+                        if ($chatId && (stripos($chatId, $keyword) !== false ||
+                            stripos($contentText, $keyword) !== false)) {
+                            $matched = true;
+                        }
+                    }
+                    
+                    // 如果指定了chat_type，需要匹配
+                    if ($matched && !empty($chatType) && $chatTypeFound != $chatType) {
+                        $matched = false;
+                    }
+                    
+                    if ($matched && $chatId) {
+                        // 检查是否已存在该聊天
+                        $key = $chatTypeFound . "_" . $chatId;
+                        if (!isset($results[$key])) {
+                            $results[$key] = [
+                                "id" => $chatId,
+                                "type" => $chatTypeFound,
+                                "last_message_time" => $time,
+                                "last_message" => mb_substr($contentText, 0, 50, 'UTF-8'),
+                                "match_count" => 0
+                            ];
+                        }
+                        $results[$key]["match_count"]++;
+                        if (strtotime($time) > strtotime($results[$key]["last_message_time"])) {
+                            $results[$key]["last_message_time"] = $time;
+                            $results[$key]["last_message"] = mb_substr($contentText, 0, 50, 'UTF-8');
+                        }
+                    }
+                } catch (Exception $e) {
+                    continue;
+                }
+            }
+        }
+        
+        // 转换为数组并按时间排序
+        $resultsList = array_values($results);
+        usort($resultsList, function($a, $b) {
+            return strtotime($b["last_message_time"]) - strtotime($a["last_message_time"]);
+        });
+        
+        echo json_encode([
+            "code" => 200,
+            "results" => $resultsList
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+        
+    case "get_nicknames":
+        // 批量获取用户昵称
+        $userIds = $_POST["user_ids"] ?? $_REQUEST["user_ids"] ?? "";
+        if (empty($userIds)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "缺少用户ID列表"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // 处理JSON字符串或数组
+        if (is_string($userIds)) {
+            $userIdsArray = json_decode($userIds, true);
+        } else {
+            $userIdsArray = $userIds;
+        }
+        
+        if (!is_array($userIdsArray)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "用户ID列表格式错误"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $nicknames = [];
+        
+        // 从日志文件中提取用户昵称
+        if (is_file($path)) {
+            $content = file_get_contents($path);
+            $lines = explode("\n", $content);
+            
+            foreach ($lines as $line) {
+                if (preg_match('/^\[([^\]]+)\]\s*(.*)$/', $line, $matches)) {
+                    $json = $matches[2];
+                    if ($json == "重复数据") continue;
+                    
+                    try {
+                        $data = json_decode($json, true);
+                        if (!is_array($data)) continue;
+                        
+                        $eventType = $data["t"] ?? "";
+                        $userId = "";
+                        
+                        // 提取用户ID和昵称
+                        if ($eventType == "GROUP_AT_MESSAGE_CREATE" || $eventType == "C2C_MESSAGE_CREATE") {
+                            $userId = $data["d"]["author"]["id"] ?? "";
+                            $rawUsername = $data["d"]["author"]["username"] ?? "";
+                            $memberNick = $data["d"]["member"]["nick"] ?? "";
+                            $username = $rawUsername ?: $memberNick;
+                            
+                            if ($userId && in_array($userId, $userIdsArray) && $username) {
+                                if (!isset($nicknames[$userId]) || empty($nicknames[$userId])) {
+                                    $nicknames[$userId] = $username;
+                                }
+                            }
+                        }
+                    } catch (Exception $e) {
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // 对于没有找到昵称的用户，使用默认值
+        foreach ($userIdsArray as $userId) {
+            if (!isset($nicknames[$userId])) {
+                $nicknames[$userId] = "用户" . substr($userId, -6);
+            }
+        }
+        
+        echo json_encode([
+            "code" => 200,
+            "nicknames" => $nicknames
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+
+    case "send":
+        // 从后台聊天页面发送文字消息到指定会话
+        $chatType = $_POST["chat_type"] ?? $_REQUEST["chat_type"] ?? "";
+        $chatId = $_POST["chat_id"] ?? $_REQUEST["chat_id"] ?? "";
+        $sendMethod = $_POST["send_method"] ?? $_REQUEST["send_method"] ?? "text";
+        $content = $_POST["content"] ?? $_REQUEST["content"] ?? "";
+
+        if (empty($appid) || empty($chatType) || empty($chatId)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "缺少必要参数"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        // 支持 text / card / native_md 类型
+        if (!in_array($sendMethod, ['text', 'card', 'native_md'])) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "不支持的消息类型，仅支持 text / card / native_md"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $content = trim($content);
+        if ($content === "") {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "消息内容不能为空"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        // 定义必要的常量，供 bot.php / function.php 使用
+        if (!defined('appid')) {
+            define('appid', $appid);
+        }
+        
+        // 从 SQLite 读取 secret 和 type（替代 main.json）
+        $botConfig = webhook_bot_config($appid);
+        if ($botConfig) {
+            if (!defined('secret') && isset($botConfig['secret'])) {
+                define('secret', $botConfig['secret']);
+            }
+            if (!defined('type') && isset($botConfig['type'])) {
+                define('type', $botConfig['type']);
+            }
+        }
+
+        // 引入机器人发送函数
+        // admin/api/chat.php -> admin -> 我的框架
+        $frameworkRoot = dirname(dirname(__DIR__));
+        $botFile = $frameworkRoot . '/bot.php';
+        $funcFile = $frameworkRoot . '/function.php';
+        
+        // 切换工作目录到框架根目录，确保 wlog() 等函数使用正确的相对路径
+        $originalDir = getcwd();
+        chdir($frameworkRoot);
+        
+        if (is_file($funcFile)) {
+            require_once $funcFile;
+        }
+        if (!is_file($botFile)) {
+            chdir($originalDir); // 恢复原目录
+            echo json_encode([
+                "code" => 500,
+                "msg" => "机器人核心文件不存在：" . $botFile
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        require_once $botFile;
+
+        // 聊天记录发送锚点：优先按钮回调 event_id（可跨时段），其次最近 msg_id（299秒）
+        $recentEventId = null;
+        $recentMsgId = null;
+        $recentMsgTime = null;
+
+        if (is_file($path)) {
+            $logContent = file_get_contents($path);
+            $lines = explode("\n", $logContent);
+
+            for ($i = count($lines) - 1; $i >= 0; $i--) {
+                $line = trim($lines[$i]);
+                if (empty($line) || $line === "重复数据") continue;
+
+                if (!preg_match('/^\[([^\]]+)\]\s*(.*)$/', $line, $matches)) continue;
+
+                $timestamp = $matches[1];
+                $jsonStr = $matches[2];
+
+                try {
+                    $data = json_decode($jsonStr, true);
+                    if (!is_array($data)) continue;
+
+                    $eventType = $data["t"] ?? "";
+
+                    if ($chatType === 'group') {
+                        $groupId = $data["d"]["group_openid"] ?? $data["d"]["group_id"] ?? "";
+                        if ($groupId !== $chatId) continue;
+
+                        if ($eventType === "INTERACTION_CREATE" && empty($recentEventId)) {
+                            $eid = $data["id"] ?? "";
+                            if (!empty($eid)) {
+                                $recentEventId = $eid;
+                                // 找到最新 event_id 后继续向前找一条 msg_id 作为兜底
+                                continue;
+                            }
+                        }
+
+                        if (($eventType === "GROUP_AT_MESSAGE_CREATE" || $eventType === "GROUP_MESSAGE_CREATE") && empty($recentMsgId)) {
+                            $mid = $data["d"]["id"] ?? "";
+                            if (!empty($mid)) {
+                                $recentMsgId = $mid;
+                                $recentMsgTime = $timestamp;
+                            }
+                        }
+                    } else {
+                        $userId = $data["d"]["openid"] ?? $data["d"]["author"]["id"] ?? "";
+                        if ($userId !== $chatId) continue;
+
+                        if ($eventType === "INTERACTION_CREATE" && empty($recentEventId)) {
+                            $eid = $data["id"] ?? "";
+                            if (!empty($eid)) {
+                                $recentEventId = $eid;
+                                continue;
+                            }
+                        }
+
+                        if ($eventType === "C2C_MESSAGE_CREATE" && empty($recentMsgId)) {
+                            $mid = $data["d"]["id"] ?? "";
+                            if (!empty($mid)) {
+                                $recentMsgId = $mid;
+                                $recentMsgTime = $timestamp;
+                            }
+                        }
+                    }
+
+                    // 两个锚点都拿到就停
+                    if (!empty($recentEventId) && !empty($recentMsgId)) {
+                        break;
+                    }
+                } catch (Exception $e) {
+                    continue;
+                }
+            }
+        }
+
+        // 无 event_id 时，msg_id 需在299秒内
+        if (empty($recentEventId) && empty($recentMsgId)) {
+            chdir($originalDir);
+            echo json_encode([
+                "code" => 400,
+                "msg" => "未找到可用锚点（event_id/msg_id），请先触发按钮交互或先发一条消息"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if (empty($recentEventId) && !empty($recentMsgId)) {
+            $msgTimestamp = strtotime($recentMsgTime);
+            $timeDiff = time() - $msgTimestamp;
+            if ($timeDiff > 299) {
+                chdir($originalDir);
+                echo json_encode([
+                    "code" => 400,
+                    "msg" => "仅找到过期msg_id（超过299秒），请先触发按钮交互或发送新消息"
+                ], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+        }
+
+        try {
+            // 定义必要常量：有event_id优先走event，其次使用有效msg_id
+            if (!defined('消息ID')) {
+                define('消息ID', !empty($recentMsgId) ? $recentMsgId : ('ROBOT1.0_EVENT_FALLBACK_' . time()));
+            }
+            if (!defined('事件ID') && !empty($recentEventId)) {
+                define('事件ID', $recentEventId);
+            }
+            if (!defined('消息来源')) {
+                define('消息来源', $chatType === 'group' ? '群聊' : '私聊');
+            }
+            if (!defined('来源')) {
+                define('来源', $chatId);
+            }
+            if (!defined('用户')) {
+                define('用户', $chatId);
+            }
+            
+            // 根据send_method调用不同的函数
+            if ($sendMethod === 'native_md') {
+                $result = 原生MD($content);
+            } elseif ($sendMethod === 'card') {
+                // 文卡函数需要数组参数，支持多行
+                // 使用 "---" 分隔不同的卡片行
+                $cardLines = explode("\n---\n", $content);
+                $cardItems = [];
+                
+                foreach ($cardLines as $line) {
+                    $line = trim($line);
+                    if (empty($line)) continue;
+                    
+                    $cardItem = ['text' => $line];
+                    
+                    // 尝试解析链接格式 "文本\n链接: URL"
+                    if (preg_match('/^(.+?)\n链接:\s*(.+)$/s', $line, $matches)) {
+                        $cardItem['text'] = trim($matches[1]);
+                        $cardItem['url'] = trim($matches[2]);
+                    }
+                    
+                    $cardItems[] = $cardItem;
+                }
+                
+                // 如果没有解析到任何项，默认为单行
+                if (empty($cardItems)) {
+                    $cardItems[] = ['text' => $content];
+                }
+                
+                $result = 文卡(...$cardItems);
+            } else {
+                $result = 文字($content);
+            }
+            $decoded = @json_decode($result, true);
+
+            // 检查返回结果
+            if (is_array($decoded)) {
+                if (isset($decoded['code']) && $decoded['code'] != 0) {
+                    $msg = $decoded['message'] ?? ($decoded['msg'] ?? '发送失败');
+                    chdir($originalDir); // 恢复原目录
+                    echo json_encode([
+                        "code" => 500,
+                        "msg" => "发送失败: " . $msg
+                    ], JSON_UNESCAPED_UNICODE);
+                    exit;
+                }
+            }
+
+            chdir($originalDir); // 恢复原目录
+            echo json_encode([
+                "code" => 200,
+                "msg" => !empty($recentEventId) ? "发送成功（event_id锚点）" : "发送成功（msg_id锚点）"
+            ], JSON_UNESCAPED_UNICODE);
+        } catch (Throwable $e) {
+            chdir($originalDir); // 恢复原目录
+            echo json_encode([
+                "code" => 500,
+                "msg" => "发送异常: " . $e->getMessage()
+            ], JSON_UNESCAPED_UNICODE);
+        }
+        break;
+    
+    case "save_format":
+        // 保存发送格式设置
+        $format = $_POST['format'] ?? $_REQUEST['format'] ?? 'text';
+        
+        if (!in_array($format, ['text', 'card', 'native_md'])) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "无效的格式类型"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // 确保 admin/data 目录存在
+        $dataDir = __DIR__ . '/../data';
+        if (!is_dir($dataDir)) {
+            mkdir($dataDir, 0755, true);
+        }
+        
+        // 保存到文件
+        $configFile = $dataDir . '/send_format_' . $appid . '.txt';
+        file_put_contents($configFile, $format);
+        
+        echo json_encode([
+            "code" => 200,
+            "msg" => "设置已保存"
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "get_format":
+        // 读取发送格式设置
+        $configFile = __DIR__ . '/../data/send_format_' . $appid . '.txt';
+        $format = 'text'; // 默认值
+        
+        if (is_file($configFile)) {
+            $format = trim(file_get_contents($configFile));
+            if (!in_array($format, ['text', 'card', 'native_md'])) {
+                $format = 'text';
+            }
+        }
+        
+        echo json_encode([
+            "code" => 200,
+            "format" => $format
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "save_templates":
+        // 保存文卡模板
+        $jsonInput = file_get_contents('php://input');
+        $data = json_decode($jsonInput, true);
+        
+        if (!isset($data['templates']) || !is_array($data['templates'])) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "无效的模板数据"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // 确保 admin/data 目录存在
+        $dataDir = __DIR__ . '/../data';
+        if (!is_dir($dataDir)) {
+            mkdir($dataDir, 0755, true);
+        }
+        
+        // 保存到文件
+        $templateFile = $dataDir . '/card_templates_' . $appid . '.json';
+        file_put_contents($templateFile, json_encode($data['templates'], JSON_UNESCAPED_UNICODE));
+        
+        echo json_encode([
+            "code" => 200,
+            "msg" => "模板已保存"
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "get_templates":
+        // 读取文卡模板
+        $templateFile = __DIR__ . '/../data/card_templates_' . $appid . '.json';
+        $templates = [];
+        
+        if (is_file($templateFile)) {
+            $content = file_get_contents($templateFile);
+            $templates = json_decode($content, true);
+            if (!is_array($templates)) {
+                $templates = [];
+            }
+        }
+        
+        echo json_encode([
+            "code" => 200,
+            "templates" => $templates
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "save_reply_mode":
+        // 保存回复模式
+        $mode = $_POST['mode'] ?? $_REQUEST['mode'] ?? 'instant';
+        
+        if (!in_array($mode, ['instant', 'delayed'])) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "无效的回复模式"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $dataDir = __DIR__ . '/../data';
+        if (!is_dir($dataDir)) {
+            mkdir($dataDir, 0755, true);
+        }
+        
+        $configFile = $dataDir . '/reply_mode_' . $appid . '.txt';
+        file_put_contents($configFile, $mode);
+        
+        echo json_encode([
+            "code" => 200,
+            "msg" => "回复模式已保存"
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "get_reply_mode":
+        // 读取回复模式
+        $configFile = __DIR__ . '/../data/reply_mode_' . $appid . '.txt';
+        $mode = 'instant';
+        
+        if (is_file($configFile)) {
+            $mode = trim(file_get_contents($configFile));
+            if (!in_array($mode, ['instant', 'delayed'])) {
+                $mode = 'instant';
+            }
+        }
+        
+        echo json_encode([
+            "code" => 200,
+            "mode" => $mode
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "save_delayed_message":
+        // 保存延迟消息
+        $chatType = $_POST['chat_type'] ?? $_REQUEST['chat_type'] ?? '';
+        $chatId = $_POST['chat_id'] ?? $_REQUEST['chat_id'] ?? '';
+        $sendMethod = $_POST['send_method'] ?? $_REQUEST['send_method'] ?? 'text';
+        $content = $_POST['content'] ?? $_REQUEST['content'] ?? '';
+        $userId = $_POST['user_id'] ?? $_REQUEST['user_id'] ?? ''; // 群聊模式下的目标用户ID
+        
+        if (empty($chatType) || empty($chatId) || empty($content)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "缺少必要参数"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $dataDir = __DIR__ . '/../data';
+        if (!is_dir($dataDir)) {
+            mkdir($dataDir, 0755, true);
+        }
+        
+        $delayedFile = $dataDir . '/delayed_messages_' . $appid . '.json';
+        $messages = [];
+        
+        if (is_file($delayedFile)) {
+            $content_file = file_get_contents($delayedFile);
+            $messages = json_decode($content_file, true);
+            if (!is_array($messages)) {
+                $messages = [];
+            }
+        }
+        
+        // 创建新的延迟消息
+        $messageId = uniqid('dm_');
+        $now = time();
+        $expiresAt = $now + (24 * 60 * 60); // 24小时后过期
+        
+        // 确定user_id：
+        // 群聊时：如果指定了userId则使用，否则为空（任何用户可触发）
+        // 私聊时：使用chatId
+        if ($chatType === 'group') {
+            $finalUserId = !empty($userId) ? $userId : '';
+        } else {
+            $finalUserId = $chatId;
+        }
+        
+        $newMessage = [
+            'id' => $messageId,
+            'appid' => $appid,
+            'chat_type' => $chatType,
+            'chat_id' => $chatId,
+            'user_id' => $finalUserId, // 群聊：目标用户ID；私聊：chat_id
+            'send_method' => $sendMethod,
+            'content' => $content,
+            'created_at' => $now,
+            'expires_at' => $expiresAt
+        ];
+        
+        $messages[] = $newMessage;
+        file_put_contents($delayedFile, json_encode($messages, JSON_UNESCAPED_UNICODE));
+        
+        echo json_encode([
+            "code" => 200,
+            "msg" => "延迟消息已保存",
+            "message_id" => $messageId
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "get_delayed_messages":
+        // 获取延迟消息列表
+        $chatType = $_GET['chat_type'] ?? $_REQUEST['chat_type'] ?? '';
+        $chatId = $_GET['chat_id'] ?? $_REQUEST['chat_id'] ?? '';
+        $userId = $_GET['user_id'] ?? $_REQUEST['user_id'] ?? ''; // 可选：筛选特定用户
+        
+        $delayedFile = __DIR__ . '/../data/delayed_messages_' . $appid . '.json';
+        $allMessages = [];
+        
+        if (is_file($delayedFile)) {
+            $content = file_get_contents($delayedFile);
+            $allMessages = json_decode($content, true);
+            if (!is_array($allMessages)) {
+                $allMessages = [];
+            }
+        }
+        
+        // 清理过期消息
+        $now = time();
+        $validMessages = [];
+        foreach ($allMessages as $msg) {
+            if ($msg['expires_at'] > $now) {
+                $validMessages[] = $msg;
+            }
+        }
+        
+        // 如果有清理，更新文件
+        if (count($validMessages) != count($allMessages)) {
+            file_put_contents($delayedFile, json_encode($validMessages, JSON_UNESCAPED_UNICODE));
+        }
+        
+        // 筛选当前聊天的消息
+        $filteredMessages = [];
+        if (!empty($chatType) && !empty($chatId)) {
+            foreach ($validMessages as $msg) {
+                // 基本匹配：chat_type 和 chat_id
+                $matchBasic = ($msg['chat_type'] === $chatType && $msg['chat_id'] === $chatId);
+                
+                // 如果指定了 user_id，还需要匹配 user_id
+                if ($matchBasic && !empty($userId)) {
+                    if ($msg['user_id'] === $userId) {
+                        $filteredMessages[] = $msg;
+                    }
+                } elseif ($matchBasic && empty($userId)) {
+                    // 未指定 user_id，返回所有匹配的消息
+                    $filteredMessages[] = $msg;
+                }
+            }
+        } else {
+            $filteredMessages = $validMessages;
+        }
+        
+        echo json_encode([
+            "code" => 200,
+            "messages" => $filteredMessages
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+    
+    case "send_delayed_message":
+        // 立即发送延迟消息
+        $messageId = $_POST['message_id'] ?? $_REQUEST['message_id'] ?? '';
+        
+        if (empty($messageId)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "缺少消息ID"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $delayedFile = __DIR__ . '/../data/delayed_messages_' . $appid . '.json';
+        $messages = [];
+        
+        if (is_file($delayedFile)) {
+            $content = file_get_contents($delayedFile);
+            $messages = json_decode($content, true);
+            if (!is_array($messages)) {
+                $messages = [];
+            }
+        }
+        
+        // 查找并发送消息
+        $targetMessage = null;
+        $remainingMessages = [];
+        
+        foreach ($messages as $msg) {
+            if ($msg['id'] === $messageId) {
+                $targetMessage = $msg;
+            } else {
+                $remainingMessages[] = $msg;
+            }
+        }
+        
+        if (!$targetMessage) {
+            echo json_encode([
+                "code" => 404,
+                "msg" => "消息不存在"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        // 更新文件（移除该消息）
+        file_put_contents($delayedFile, json_encode($remainingMessages, JSON_UNESCAPED_UNICODE));
+        
+        // 发送消息（直接复用send逻辑，不添加@标记）
+        $_POST['chat_type'] = $targetMessage['chat_type'];
+        $_POST['chat_id'] = $targetMessage['chat_id'];
+        $_POST['send_method'] = $targetMessage['send_method'];
+        $_POST['content'] = $targetMessage['content'];
+        $_REQUEST['type'] = 'send';
+        
+        // 递归调用send逻辑
+        include __FILE__;
+        exit;
+        break;
+    
+    case "delete_delayed_message":
+        // 删除延迟消息
+        $messageId = $_POST['message_id'] ?? $_REQUEST['message_id'] ?? '';
+        
+        if (empty($messageId)) {
+            echo json_encode([
+                "code" => 400,
+                "msg" => "缺少消息ID"
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        
+        $delayedFile = __DIR__ . '/../data/delayed_messages_' . $appid . '.json';
+        $messages = [];
+        
+        if (is_file($delayedFile)) {
+            $content = file_get_contents($delayedFile);
+            $messages = json_decode($content, true);
+            if (!is_array($messages)) {
+                $messages = [];
+            }
+        }
+        
+        // 过滤掉要删除的消息
+        $remainingMessages = [];
+        foreach ($messages as $msg) {
+            if ($msg['id'] !== $messageId) {
+                $remainingMessages[] = $msg;
+            }
+        }
+        
+        file_put_contents($delayedFile, json_encode($remainingMessages, JSON_UNESCAPED_UNICODE));
+        
+        echo json_encode([
+            "code" => 200,
+            "msg" => "消息已删除"
+        ], JSON_UNESCAPED_UNICODE);
+        break;
+        
+    default:
+        echo json_encode([
+            "code" => 400,
+            "msg" => "无效的请求类型"
+        ], JSON_UNESCAPED_UNICODE);
+}
+
